@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>power-pie-card dev harness</title>
+<title>usage-pie-card dev harness</title>
 <style>
   body { font-family: system-ui, sans-serif; margin: 20px; background: #f0f0ee; }
   body.dark { background: #0d0d0d; color: #fff; }
@@ -50,7 +50,7 @@ class HaCard extends HTMLElement {
 customElements.define("ha-card", HaCard);
 </script>
 <script type="module">
-import "../power-pie-card.js";
+import "../usage-pie-card.js";
 
 const log = (m) => {
   document.getElementById("log").textContent =
@@ -99,16 +99,31 @@ document.getElementById("darkmode").checked = dark;
 const hass = { states: buildStates(), themes: { darkMode: dark }, entities: {}, areas: {}, devices: {} };
 
 // --- cards ----------------------------------------------------------------
+const water = new URLSearchParams(location.search).has("water");
+if (water) {
+  for (const id of Object.keys(base)) delete base[id];
+  Object.assign(base, {
+    "sensor.water_kitchen": [0.125, "m³", "Kitchen"],
+    "sensor.water_bath": [0.080, "m³", "Bathroom"],
+    "sensor.water_laundry": [35, "L", "Laundry"],
+    "sensor.water_garden": [0.250, "m³", "Garden"],
+    "sensor.water_guest": [0, undefined, "Guest (zero, no unit)"],
+    "sensor.water_utility": [0.015, "m³", "Utility"],
+    "sensor.water_bad_unit": [3, "W", "Incompatible (ignored)"],
+  });
+  hass.states = buildStates();
+}
 const config = {
-  type: "custom:power-pie-card",
-  title: "Aktuelle Strom Verbraucher",
-  total_amount: "sensor.haus_leistung",
+  type: "custom:usage-pie-card",
+  title: water ? "Daily water usage" : "Aktuelle Strom Verbraucher",
+  total_amount: water ? 800 : "sensor.haus_leistung",
   unknown_text: "Ungemessen",
   other_text: "Andere",
-  display_unit: "kW",
+  display_unit: water ? "m³" : "kW",
+  refresh_interval: 5,
   filter: {
-    include: [{ entity_id: "*_pwr*" }],
-    exclude: [{ state: "< 1" }],
+    include: [{ entity_id: water ? "sensor.water_*" : "*_pwr*" }],
+    exclude: water ? [] : [{ state: "< 1" }],
   },
 };
 
@@ -117,7 +132,7 @@ for (const stage of document.querySelectorAll(".stage")) {
   const label = document.createElement("h4");
   label.textContent = stage.className.replace("stage ", "");
   stage.append(label);
-  const card = document.createElement("power-pie-card");
+  const card = document.createElement("usage-pie-card");
   card.setConfig(JSON.parse(JSON.stringify(config)));
   card.style.height = "100%";
   card.style.display = "block";
@@ -156,7 +171,13 @@ setInterval(() => {
   n++;
   document.getElementById("tick").textContent = `tick ${n}`;
   for (const [id, [v, u, name]] of Object.entries(base)) {
-    if (!id.includes("_pwr") || !isFinite(Number(v))) continue;
+    if ((!water && !id.includes("_pwr")) || (water && !id.startsWith("sensor.water_")) || !isFinite(Number(v))) continue;
+    if (water) {
+      if (id === "sensor.water_bad_unit" || id === "sensor.water_guest") continue;
+      const nv = Math.max(0, Number(hass.states[id].state) + Math.random() * 0.002);
+      hass.states[id] = mkState(id, nv.toFixed(u === "L" ? 1 : 4), u, name);
+      continue;
+    }
     // Random walk ±8%; Waschmaschine oscillates across the 1 W threshold.
     let nv;
     if (id === "sensor.waschmaschine_pwr") {
@@ -173,7 +194,7 @@ setInterval(() => {
       const n2 = Number(st.state);
       return s + (isFinite(n2) ? (st.attributes.unit_of_measurement === "kW" ? n2 * 1000 : n2) : 0);
     }, 0);
-  hass.states["sensor.haus_leistung"] = mkState("sensor.haus_leistung", Math.round(sum + 850), "W", "Haus Leistung");
+  if (!water) hass.states["sensor.haus_leistung"] = mkState("sensor.haus_leistung", Math.round(sum + 850), "W", "Haus Leistung");
   push();
 }, 2000);
 </script>

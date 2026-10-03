@@ -1,13 +1,15 @@
 /**
- * power-pie-card
- * A dependency-free doughnut chart card for Home Assistant with built-in
- * entity filtering, a sorted value legend, and freeze-on-hover updates.
- *
- * https://github.com/stefanschaedeli/power-pie-card
+ * usage-pie-card
+ * A dependency-free, unit-aware doughnut chart card for Home Assistant.
+ * Derived from ishioni/power-pie-card v0.3.1 (stefanschaedeli/power-pie-card).
  * MIT License
  */
 
-const VERSION = "0.3.0";
+const VERSION = "0.3.1-usage.1";
+const DISPLAY_UNITS = ["W", "kW", "L", "m³"];
+const UNITS = { W: { family: "power", factor: 1 }, kW: { family: "power", factor: 1000 },
+  mW: { family: "power", factor: 0.001 },
+  L: { family: "volume", factor: 1 }, "m³": { family: "volume", factor: 1000 } };
 
 // Validated categorical palette (8 slots, light + dark surface variants).
 // Hue order is CVD-safety-optimized — do not reorder or cycle past 8;
@@ -85,17 +87,21 @@ function compileRule(rule) {
   return (id, hass) => tests.every((t) => t(id, hass));
 }
 
-// Convert a state object's numeric value to watts using its unit.
-function toWatts(value, unit) {
-  const u = (unit || "").toLowerCase();
-  if (u === "kw") return value * 1000;
-  if (u === "mw") return value / 1000; // milliwatts
-  return value; // W or unknown → assume W
+// Convert to the family's base unit (W or L). Never silently label an incompatible sensor.
+function toBase(value, unit, displayUnit) {
+  if (!Number.isFinite(value)) return null;
+  if (!unit && value === 0) return 0; // some HA sensors omit the unit at zero
+  const normalized = typeof unit === "string" && /^[km]?w$/i.test(unit)
+    ? { w: "W", kw: "kW", mw: "mW" }[unit.toLowerCase()] : unit;
+  const source = Object.hasOwn(UNITS, normalized) ? UNITS[normalized] : null;
+  if (!source || source.family !== UNITS[displayUnit].family) return null;
+  const base = value * source.factor;
+  return Number.isFinite(base) ? base : null;
 }
 
 // --- card ------------------------------------------------------------------
 
-class PowerPieCard extends HTMLElement {
+class UsagePieCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
@@ -105,28 +111,38 @@ class PowerPieCard extends HTMLElement {
     this._pendingModel = null;
     this._modelKey = null;
     this._touchTimer = null;
+    this._refreshTimer = null;
+    this._lastPaintAt = null;
   }
 
   static getStubConfig() {
     return {
-      title: "Power",
-      filter: { include: [{ entity_id: "sensor.*_pwr*" }], exclude: [{ state: "< 1" }] },
+      title: "Usage",
+      filter: { include: [{ entity_id: "sensor.*" }] },
       display_unit: "W",
     };
   }
 
   static getConfigElement() {
-    return document.createElement("power-pie-card-editor");
+    return document.createElement("usage-pie-card-editor");
   }
 
   setConfig(config) {
     if (!config.filter && !config.entities) {
-      throw new Error("power-pie-card: define `filter` and/or `entities`");
+      throw new Error("usage-pie-card: define `filter` and/or `entities`");
     }
     const c = { ...config };
     c.unknown_text = c.unknown_text || c.unknownText || "Unknown";
-    c.display_unit = c.display_unit === "kW" ? "kW" : "W";
-    c.decimals = Number.isFinite(c.decimals) ? c.decimals : (c.display_unit === "kW" ? 2 : 0);
+    c.display_unit = c.display_unit ?? "W";
+    if (!DISPLAY_UNITS.includes(c.display_unit)) throw new Error(`usage-pie-card: unsupported display_unit ${c.display_unit}`);
+    c.decimals = Number.isInteger(c.decimals) && c.decimals >= 0 && c.decimals <= 10
+      ? c.decimals : (["kW", "m³"].includes(c.display_unit) ? 2 : 0);
+    c.show_value = c.show_value !== false;
+    c.show_percentage = c.show_percentage !== false;
+    if (c.refresh_interval !== undefined && (!Number.isFinite(c.refresh_interval) || c.refresh_interval < 0)) {
+      throw new Error("usage-pie-card: refresh_interval must be a non-negative number of seconds");
+    }
+    c.refresh_interval = c.refresh_interval || 0;
     c.sort = c.sort === "none" ? "none" : "max";
     c.max_slices = Math.min(Number.isFinite(c.max_slices) ? c.max_slices : 8, PALETTE_LIGHT.length);
     c.slice_gap = Number.isFinite(c.slice_gap) ? Math.min(Math.max(c.slice_gap, 0), 5) : 0.8;
@@ -140,6 +156,10 @@ class PowerPieCard extends HTMLElement {
     );
     this._config = c;
     this._modelKey = null;
+    this._pendingModel = null;
+    this._lastPaintAt = null;
+    clearTimeout(this._refreshTimer);
+    this._refreshTimer = null;
     this._buildDom();
     if (this._hass) this.hass = this._hass;
   }
@@ -220,10 +240,14 @@ class PowerPieCard extends HTMLElement {
         color: var(--secondary-text-color, #52514e);
       }
       .row {
-        display: grid; grid-template-columns: 12px 1fr auto auto;
+        display: grid; grid-template-columns: 12px minmax(0, 1fr) auto auto;
         gap: 0 8px; align-items: center; padding: 2px 4px; border-radius: 6px;
         font-size: 13px; cursor: pointer; user-select: none;
       }
+      .row.no-value { grid-template-columns: 12px minmax(0, 1fr) auto; }
+      .row.no-percentage { grid-template-columns: 12px minmax(0, 1fr) auto; }
+      .row.no-value.no-percentage { grid-template-columns: 12px minmax(0, 1fr); }
+      .row.no-value .val, .row.no-percentage .pct { display: none; }
       .row.inert { cursor: default; }
       .row:hover, .row.hot { background: var(--secondary-background-color, rgba(127,127,127,.12)); }
       .row .dot { width: 10px; height: 10px; border-radius: 50%; }
@@ -312,13 +336,24 @@ class PowerPieCard extends HTMLElement {
     }, { passive: true });
   }
 
+  connectedCallback() {
+    if (this._config && this._hass) {
+      this._pendingModel = this._computeModel(this._hass);
+      this._flushPending(true); // catch up immediately after a disconnect
+    }
+  }
+
+  disconnectedCallback() {
+    clearTimeout(this._refreshTimer);
+    clearTimeout(this._touchTimer);
+    this._refreshTimer = null;
+    this._touchTimer = null;
+    this._frozen = false;
+  }
+
   _setFrozen(frozen) {
     this._frozen = frozen;
-    if (!frozen && this._pendingModel) {
-      const m = this._pendingModel;
-      this._pendingModel = null;
-      this._render(m);
-    }
+    if (!frozen) this._flushPending();
     this._updatePausedBadge();
   }
 
@@ -326,17 +361,40 @@ class PowerPieCard extends HTMLElement {
     this._pausedEl.style.display = this._frozen && this._pendingModel ? "block" : "none";
   }
 
-  set hass(hass) {
-    this._hass = hass;
-    if (!this._config) return;
-    const model = this._computeModel(hass);
-    if (model.key === this._modelKey) return;
-    if (this._frozen) {
-      this._pendingModel = model;
+  _flushPending(force = false) {
+    if (!this.isConnected || !this._pendingModel || this._frozen) return;
+    if (this._pendingModel.key === this._modelKey) {
+      this._pendingModel = null;
+      clearTimeout(this._refreshTimer);
+      this._refreshTimer = null;
       this._updatePausedBadge();
       return;
     }
+    const remaining = this._config.refresh_interval * 1000 - (Date.now() - this._lastPaintAt);
+    if (!force && this._lastPaintAt !== null && remaining > 0) {
+      if (!this._refreshTimer) {
+        this._refreshTimer = setTimeout(() => {
+          this._refreshTimer = null;
+          this._flushPending();
+        }, remaining);
+      }
+      this._updatePausedBadge();
+      return;
+    }
+    clearTimeout(this._refreshTimer);
+    this._refreshTimer = null;
+    const model = this._pendingModel;
+    this._pendingModel = null;
     this._render(model);
+    this._lastPaintAt = Date.now();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (!this._config || !this.isConnected) return;
+    this._pendingModel = this._computeModel(hass);
+    this._flushPending();
+    this._updatePausedBadge();
   }
 
   get hass() {
@@ -360,24 +418,27 @@ class PowerPieCard extends HTMLElement {
 
     // Excludes + numeric parse (unavailable/unknown/non-numeric drop out here).
     let items = [];
+    let incompatible = 0;
     for (const id of ids) {
       if (this._exclude.some((rule) => rule(id, hass))) continue;
       const st = hass.states[id];
       if (!st) continue;
+      if (typeof st.state !== "string" || !st.state.trim()) continue;
       const raw = Number(st.state);
-      if (!isFinite(raw)) continue;
-      const watts = toWatts(raw, st.attributes.unit_of_measurement);
-      if (watts <= 0) continue;
+      if (!Number.isFinite(raw)) continue;
+      const base = toBase(raw, st.attributes?.unit_of_measurement, c.display_unit);
+      if (base === null) { incompatible++; continue; }
+      if (base < 0) continue;
       const m = meta.get(id) || {};
       items.push({
         id,
-        name: m.name || st.attributes.friendly_name || id,
+        name: m.name || st.attributes?.friendly_name || id,
         color: m.color,
-        watts,
+        base,
       });
     }
 
-    if (c.sort === "max") items.sort((a, b) => b.watts - a.watts);
+    if (c.sort === "max") items.sort((a, b) => b.base - a.base);
 
     // Fold slices beyond the palette into "other" (never cycle hues).
     let folded = null;
@@ -387,7 +448,7 @@ class PowerPieCard extends HTMLElement {
       folded = {
         id: "__other__",
         name: `${c.other_text} (${rest.length})`,
-        watts: rest.reduce((s, x) => s + x.watts, 0),
+        base: rest.reduce((s, x) => s + x.base, 0),
         color: dark ? OTHER_COLOR.dark : OTHER_COLOR.light,
         inert: true,
       };
@@ -411,7 +472,7 @@ class PowerPieCard extends HTMLElement {
       if (!present.has(key)) this._slots.delete(key);
     }
 
-    const measured = items.reduce((s, x) => s + x.watts, 0) + (folded ? folded.watts : 0);
+    const measured = items.reduce((s, x) => s + x.base, 0) + (folded ? folded.base : 0);
 
     // Total: entity, number, or fall back to the measured sum.
     let total = measured;
@@ -419,16 +480,20 @@ class PowerPieCard extends HTMLElement {
     if (c.total_amount !== undefined) {
       const st = hass.states[c.total_amount];
       let t = NaN;
-      if (st) t = toWatts(Number(st.state), st.attributes.unit_of_measurement);
-      else if (isFinite(Number(c.total_amount))) t = Number(c.total_amount);
-      if (isFinite(t) && t > 0) {
+      if (st && typeof st.state === "string" && st.state.trim()) {
+        t = toBase(Number(st.state), st.attributes?.unit_of_measurement, c.display_unit);
+      }
+      else if (!st && typeof c.total_amount === "string" && c.total_amount.trim() &&
+        Number.isFinite(Number(c.total_amount))) t = Number(c.total_amount);
+      else if (typeof c.total_amount === "number" && Number.isFinite(c.total_amount)) t = c.total_amount;
+      if (t !== null && Number.isFinite(t) && t >= 0) {
         total = Math.max(t, measured);
         const rest = t - measured;
         if (rest > 0) {
           remainder = {
             id: "__remainder__",
             name: c.unknown_text,
-            watts: rest,
+            base: rest,
             color: dark ? REMAINDER_COLOR.dark : REMAINDER_COLOR.light,
             inert: true,
           };
@@ -440,8 +505,8 @@ class PowerPieCard extends HTMLElement {
     if (folded) slices.push(folded);
     if (remainder) slices.push(remainder);
 
-    const fmt = (watts) => {
-      const v = c.display_unit === "kW" ? watts / 1000 : watts;
+    const fmt = (base) => {
+      const v = base / UNITS[c.display_unit].factor;
       return `${v.toLocaleString(undefined, {
         minimumFractionDigits: c.decimals,
         maximumFractionDigits: c.decimals,
@@ -449,9 +514,9 @@ class PowerPieCard extends HTMLElement {
     };
 
     for (const s of slices) {
-      s.valueText = fmt(s.watts);
-      s.pct = total > 0 ? (s.watts / total) * 100 : 0;
-      s.pctText = s.pct >= 0.95 ? `${Math.round(s.pct)}%` : "<1%";
+      s.valueText = fmt(s.base);
+      s.pct = total > 0 ? (s.base / total) * 100 : 0;
+      s.pctText = s.pct === 0 ? "0%" : s.pct >= 0.95 ? `${Math.round(s.pct)}%` : "<1%";
     }
 
     const model = {
@@ -459,13 +524,14 @@ class PowerPieCard extends HTMLElement {
       totalText: fmt(total),
       unit: c.display_unit,
       dark,
+      incompatible,
     };
-    // Diff key: only what is actually displayed. Sub-resolution jitter in the
-    // source sensors therefore causes no re-render at all.
+    // Include every visible setting and arc size; a changed unit or slice geometry
+    // must not be hidden by an identical rounded value.
     model.key = JSON.stringify([
-      dark,
-      model.totalText,
-      slices.map((s) => [s.id, s.name, s.valueText, s.pctText, s.color]),
+      dark, c.display_unit, c.decimals, c.legend, c.slice_gap,
+      c.show_value, c.show_percentage, model.totalText, incompatible,
+      slices.map((s) => [s.id, s.name, s.valueText, s.pctText, s.color, s.pct]),
     ]);
     return model;
   }
@@ -479,7 +545,8 @@ class PowerPieCard extends HTMLElement {
     this._layoutEl.style.display = empty ? "none" : "";
     this._emptyEl.style.display = empty ? "" : "none";
     if (empty) {
-      this._emptyEl.textContent = "No matching entities";
+      this._emptyEl.textContent = model.incompatible
+        ? "No compatible entities (check sensor units)" : "No matching entities";
       return;
     }
 
@@ -504,7 +571,7 @@ class PowerPieCard extends HTMLElement {
         this._svg.appendChild(el);
         this._arcs.set(s.id, el);
       }
-      const len = Math.max(s.pct - GAP, 0.15);
+      const len = s.pct > 0 ? Math.max(s.pct - GAP, 0.15) : 0;
       const dashStart = start + GAP / 2;
       const apply = () => {
         el.style.stroke = s.color;
@@ -530,7 +597,9 @@ class PowerPieCard extends HTMLElement {
     this._legendEl.innerHTML = "";
     for (const s of model.slices) {
       const row = document.createElement("div");
-      row.className = "row" + (s.inert ? " inert" : "");
+      row.className = "row" + (s.inert ? " inert" : "") +
+        (this._config.show_value ? "" : " no-value") +
+        (this._config.show_percentage ? "" : " no-percentage");
       row.dataset.id = s.id;
       row.innerHTML = `
         <span class="dot"></span>
@@ -539,8 +608,8 @@ class PowerPieCard extends HTMLElement {
         <span class="pct"></span>`;
       row.querySelector(".dot").style.background = s.color;
       row.querySelector(".name").textContent = s.name;
-      row.querySelector(".val").textContent = `${s.valueText} ${model.unit}`;
-      row.querySelector(".pct").textContent = s.pctText;
+      row.querySelector(".val").textContent = this._config.show_value ? `${s.valueText} ${model.unit}` : "";
+      row.querySelector(".pct").textContent = this._config.show_percentage ? s.pctText : "";
       row.addEventListener("mouseenter", () => this._highlight(s.id, true));
       row.addEventListener("mouseleave", () => this._highlight(s.id, false));
       if (!s.inert) {
@@ -578,7 +647,10 @@ class PowerPieCard extends HTMLElement {
     const s = this._model && this._model.slices.find((x) => x.id === id);
     if (!s) return;
     const tt = this._tooltipEl;
-    tt.textContent = `${s.name}: ${s.valueText} ${this._model.unit} (${s.pctText})`;
+    const details = [];
+    if (this._config.show_value) details.push(`${s.valueText} ${this._model.unit}`);
+    if (this._config.show_percentage) details.push(s.pctText);
+    tt.textContent = `${s.name}${details.length ? `: ${details.join(" · ")}` : ""}`;
     tt.style.display = "block";
     const rect = this._chartEl.getBoundingClientRect();
     let x = ev.clientX - rect.left + 12;
@@ -604,35 +676,39 @@ class PowerPieCard extends HTMLElement {
   }
 }
 
-customElements.define("power-pie-card", PowerPieCard);
+customElements.define("usage-pie-card", UsagePieCard);
 
 // --- GUI editor ------------------------------------------------------------
 //
 // Uses HA's native ha-form + selectors. The common filter case (one include
-// glob + one "hide below N W" exclude) gets first-class GUI fields; anything
+// glob + one "hide below N" exclude) gets first-class GUI fields; anything
 // more complex falls back to an object (YAML) sub-editor for just the filter,
 // while every other option stays GUI-editable.
 
 const MANAGED_KEYS = ["title", "total_amount", "display_unit", "decimals",
-  "unknown_text", "other_text", "max_slices", "sort", "slice_gap", "legend"];
+  "unknown_text", "other_text", "max_slices", "sort", "slice_gap", "legend",
+  "refresh_interval", "show_value", "show_percentage"];
 
 const EDITOR_LABELS = {
   title: "Title",
   total_amount: "Total sensor (derives the unmeasured slice)",
   display_unit: "Display unit",
   decimals: "Decimals",
+  refresh_interval: "Minimum seconds between paints (0 = immediate)",
+  show_value: "Show values in legend and tooltips",
+  show_percentage: "Show percentages in legend and tooltips",
   unknown_text: "Label for unmeasured remainder",
   other_text: "Label for folded small slices",
   max_slices: "Max colored slices",
   sort: "Sort order",
   slice_gap: "Gap between slices (% of circle)",
   legend: "Legend position",
-  filter_pattern: "Include entities matching (glob, e.g. *_pwr*)",
-  filter_min: "Hide entities below (W)",
+  filter_pattern: "Include entities matching (glob, e.g. *_water*)",
+  filter_min: "Hide entities with raw state below (source unit)",
   filter: "Filter (advanced — too complex for the simple fields)",
 };
 
-class PowerPieCardEditor extends HTMLElement {
+class UsagePieCardEditor extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
@@ -717,14 +793,18 @@ class PowerPieCardEditor extends HTMLElement {
         name: "display_unit",
         selector: { select: { mode: "dropdown", options: [
           { value: "W", label: "W" }, { value: "kW", label: "kW" },
+          { value: "L", label: "L" }, { value: "m³", label: "m³" },
         ] } },
       },
-      { name: "decimals", selector: { number: { min: 0, max: 3, step: 1, mode: "box" } } },
+      { name: "decimals", selector: { number: { min: 0, max: 10, step: 1, mode: "box" } } },
+      { name: "refresh_interval", selector: { number: { min: 0, step: 1, mode: "box", unit_of_measurement: "s" } } },
+      { name: "show_value", selector: { boolean: {} } },
+      { name: "show_percentage", selector: { boolean: {} } },
     ];
     if (this._simpleFilter) {
       schema.push(
         { name: "filter_pattern", selector: { text: {} } },
-        { name: "filter_min", selector: { number: { min: 0, step: 1, mode: "box", unit_of_measurement: "W" } } },
+        { name: "filter_min", selector: { number: { min: 0, step: 0.01, mode: "box" } } },
       );
     } else {
       schema.push({ name: "filter", selector: { object: {} } });
@@ -755,6 +835,8 @@ class PowerPieCardEditor extends HTMLElement {
 
     const data = {};
     for (const k of MANAGED_KEYS) if (c[k] !== undefined) data[k] = c[k];
+    data.show_value = c.show_value !== false;
+    data.show_percentage = c.show_percentage !== false;
     if (data.unknown_text === undefined && c.unknownText !== undefined) {
       data.unknown_text = c.unknownText;
     }
@@ -801,19 +883,18 @@ class PowerPieCardEditor extends HTMLElement {
   }
 }
 
-customElements.define("power-pie-card-editor", PowerPieCardEditor);
+customElements.define("usage-pie-card-editor", UsagePieCardEditor);
 
 window.customCards = window.customCards || [];
 window.customCards.push({
-  type: "power-pie-card",
-  name: "Power Pie Card",
+  type: "usage-pie-card",
+  name: "Usage Pie Card",
   description:
-    "Doughnut chart with built-in entity filtering, sorted value legend, and freeze-on-hover updates.",
-  documentationURL: "https://github.com/stefanschaedeli/power-pie-card",
+    "Unit-aware doughnut chart for power or water usage with filtering and optional refresh throttle.",
 });
 
 console.info(
-  `%c POWER-PIE-CARD %c v${VERSION} `,
+  `%c USAGE-PIE-CARD %c v${VERSION} `,
   "color: #fff; background: #2a78d6; font-weight: 600;",
   "color: #2a78d6; background: #fff; font-weight: 600;"
 );

@@ -1,120 +1,59 @@
-# power-pie-card
+# Usage Pie Card
 
-A dependency-free doughnut chart card for Home Assistant — built as a modern
-replacement for the unmaintained `pie-chart-card`, with entity filtering built in
-(no `auto-entities` wrapper needed).
-
-![live card](docs/live-card.png)
-
-Dark theme:
-
-![dark](docs/card-dark.png)
-
-## Why
-
-The original `pie-chart-card` re-creates its whole Chart.js instance on every
-state change (so the chart flickers and resets while you try to read it), hard-codes
-its height to 480 px (so it overflows on mobile), and loads Chart.js 2.9 from a CDN
-at runtime. This card fixes all of that:
-
-- **Zero dependencies** — one self-contained ES module, SVG rendering, no CDN, no build.
-- **Calm updates** — re-renders only when a *displayed* value actually changes, and
-  **freezes while you hover or touch** the card (a small ⏸ appears; it catches up the
-  moment you leave).
-- **Responsive** — fills whatever space the dashboard gives it; legend moves beside
-  the chart on wide cards, below it on narrow ones. Works with `grid_options` and
-  sections layouts.
-- **Real legend** — sorted max→min with value and percentage; hover to highlight the
-  slice; click to open the entity's more-info dialog.
-- **Built-in filtering** — auto-entities-style include/exclude rules (glob or regex
-  entity_id, domain, area, state comparisons).
-- **Stable, CVD-safe colors** — a validated 8-hue palette with light/dark variants;
-  colors stick to entities (they don't shuffle when the sort order changes), and
-  slices beyond 8 fold into an "Other" group instead of cycling hues.
-- **Unit-aware** — mixes W and kW source sensors correctly; displays everything in
-  one unit of your choice.
+A dependency-free Home Assistant doughnut card for power **or** volume usage. Forked from [stefanschaedeli/power-pie-card v0.3.1](https://github.com/stefanschaedeli/power-pie-card). It uses a distinct `usage-pie-card` element, editor and `usage-pie-card.js` resource so it can coexist with Power Pie Card. See [LICENSE](LICENSE).
 
 ## Installation
 
-### HACS (custom repository)
-
-1. HACS → Custom repositories → add `stefanschaedeli/power-pie-card`, category *Dashboard*.
-2. Install **Power Pie Card**, reload resources when prompted.
-
-### Manual
-
-Copy `power-pie-card.js` to `/config/www/` and add a dashboard resource:
+Add `ishioni/power-pie-card` as a HACS *Dashboard* custom repository and install **Usage Pie Card**, or copy `usage-pie-card.js` into `/config/www/` and register:
 
 ```yaml
-url: /local/power-pie-card.js
+url: /local/usage-pie-card.js
 type: module
 ```
 
-## Configuration
+Do not use the upstream `power-pie-card.js` resource for this card. Reload the browser after changing resources.
 
-The card has a **visual editor** (dashboard → edit card): all options are editable via
-GUI fields, including the filter for the common case (one include glob + a
-"hide below N W" threshold). Filters too complex for the simple fields — multiple
-include rules, area/domain rules, non-threshold excludes — show up as a structured
-object sub-editor instead, without losing anything.
-
-![visual editor](docs/visual-editor.png)
-
-YAML reference:
+## Daily water meters (L)
 
 ```yaml
-type: custom:power-pie-card
-title: Aktuelle Strom Verbraucher
-total_amount: sensor.haus_leistung   # entity or number; derives an "unmeasured" slice
-unknown_text: Ungemessen             # label for the unmeasured remainder
-other_text: Andere                   # label for folded small slices
-display_unit: kW                     # W | kW — one unit for total, legend, tooltips
-filter:
-  include:
-    - entity_id: "*_pwr*"            # glob; /^sensor\.x/ regex also works
-  exclude:
-    - state: "< 1"
+type: custom:usage-pie-card
+title: Today's usage by meter
+display_unit: L
+entities:
+  - {entity: sensor.daily_kitchen_water, name: Kitchen}
+  - {entity: sensor.daily_bathroom_water, name: Bathroom}
+refresh_interval: 60
+show_value: true
+show_percentage: true
 ```
 
-| Option | Default | Description |
+Each sensor's `unit_of_measurement` must be `m³` or `L` (mixing these is fine). For example, 0.125 m³ + 35 L displays as 0.16 m³ (with default two decimals); select `display_unit: L` to display 160 L. Values are *not* rates; use daily consumption entities, not flow-rate sensors.
+
+## Options
+
+| Option | Default | Meaning |
 |---|---|---|
-| `filter.include` | — | List of rules; an entity matching **any** rule is included. Rule keys: `entity_id` (glob or `/regex/`), `domain`, `area` (id or name), `state` (comparison or literal). All keys in one rule must match. |
-| `filter.exclude` | — | Same rule syntax; matching entities are dropped. Unavailable / unknown / non-numeric states are always dropped automatically. |
-| `entities` | — | Optional static list (`entity_id` strings or `{entity, name, color}`), merged with filter results. Old pie-chart-card configs keep working. |
-| `title` | — | Card header (omit for a headless card). |
-| `total_amount` | sum of slices | Entity id or number. If larger than the measured sum, the rest becomes a gray remainder slice. |
-| `unknown_text` | `Unknown` | Remainder slice label (`unknownText` also accepted). |
-| `other_text` | `Other` | Label for slices folded beyond `max_slices`. |
-| `display_unit` | `W` | `W` or `kW`; applied uniformly everywhere. |
-| `decimals` | 0 (W) / 2 (kW) | Fraction digits for displayed values. |
-| `sort` | `max` | `max` (largest first) or `none` (input order). |
-| `slice_gap` | `0.8` | Gap between slices, in % of the circle circumference (0–5; 0 = touching slices). |
-| `legend` | `auto` | Legend position: `auto` (beside the chart on wide cards, below on narrow), `top`, `bottom`, `left`, `right`, or `none` (hidden). |
-| `max_slices` | 8 | Colored slices before folding into "Other" (8 is also the palette maximum — hues are never cycled). |
+| `filter.include`, `filter.exclude` | none | Any matching include rule selects an entity; exclude rules remove it. Keys: `entity_id` (glob or `/regex/`), `domain`, `area`, `state` (comparison or literal). |
+| `entities` | none | Static entity IDs or `{entity, name, color}` objects, merged with filtered entities. At least `entities` or `filter` is required. |
+| `title` | none | Card heading. |
+| `display_unit` | `W` | `W`, `kW`, `L` or `m³`; selects the unit family as well as the displayed unit. |
+| `total_amount` | sum of compatible sensors | Total entity ID or numeric total (number or numeric string) in the **base unit** (`W` for power, `L` for volume). A larger total adds an untracked remainder. Numeric totals retain the original power card's W semantics even when displaying kW. |
+| `unknown_text`, `other_text` | `Unknown`, `Other` | Labels for the untracked and folded slices. Legacy `unknownText` is accepted. |
+| `decimals` | 0 (`W`, `L`), 2 (`kW`, `m³`) | Display precision (0–10). |
+| `sort` | `max` | `max` or `none`. |
+| `slice_gap` | 0.8 | Gap as percent of the circumference (0–5). |
+| `legend` | `auto` | `auto`, `top`, `bottom`, `left`, `right`, `none`. |
+| `max_slices` | 8 | Number of colored entity slices; extras fold into Other. |
+| `show_value` | `true` | Show values in legend and chart tooltips. |
+| `show_percentage` | `true` | Show percentages in legend and chart tooltips. |
+| `refresh_interval` | `0` | Minimum seconds between paints; latest state wins. Zero paints immediately on each meaningful change. Initial paint and reconnect catch-up are immediate. |
 
-### Notes
+The visual editor exposes these display and timing controls. The simple filter editor compares **raw source states** (e.g. `< 1` means less than 1 in *each sensor's own unit*); when mixing L and m³, avoid raw-state thresholds or use advanced filtering with care.
 
-- Source sensors may mix `W` and `kW` (`unit_of_measurement` is respected);
-  everything is converted internally and displayed in `display_unit`.
-- Colors are assigned per entity for the lifetime of the card and released when an
-  entity leaves the set. Pin a color permanently with a static entry:
-  `entities: [{entity: sensor.boiler_pwr, color: "#4a3aa7"}]`.
-- Updates pause while a mouse pointer is over the card, and for 10 s after a touch.
+Incompatible or unknown units are **excluded**, not interpreted as the selected display unit (including on `total_amount`). A numeric zero with no unit is retained in the legend as 0; a positive reading with no unit is excluded. Unavailable, unknown, negative and non-numeric readings are excluded. The displayed total is the greater of measured sum and a valid configured total. A zero-only set shows a 0 total and no visible arcs.
+
+Mouse hover pauses display updates until the pointer leaves; touch pauses for ten seconds after the last touch. Throttled updates coalesce to the latest Home Assistant state, and timers are cleared when the card disconnects.
 
 ## Development
 
-Open `dev/index.html` in a browser (serve the folder or launch Chrome with
-`--allow-file-access-from-files`) — it renders the card at three sizes against a
-mocked, churning `hass` object with light/dark toggles.
-
-## Acknowledgments
-
-Thanks to [sdelliot](https://github.com/sdelliot) — the original
-[pie-chart-card](https://github.com/sdelliot/pie-chart-card) inspired this card and
-served its users well for years. power-pie-card started as its spiritual successor
-and keeps its configuration (`entities`, `title`, `total_amount`, `unknownText`)
-working unchanged.
-
-## License
-
-MIT
+Serve this directory and open `dev/index.html` to see power data at three sizes, or `dev/index.html?water` for the six-water-meter example (including zero without a unit and an incompatible W sensor). Run `node --test tests/usage-pie-card.test.cjs` for unit and scheduling tests.
