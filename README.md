@@ -4,7 +4,7 @@ A dependency-free Home Assistant doughnut card for power **or** volume usage. Fo
 
 ## Installation
 
-Add `ishioni/power-pie-card` as a HACS *Dashboard* custom repository and install **Usage Pie Card**, or copy `usage-pie-card.js` into `/config/www/` and register:
+Add `ishioni/usage-pie-card` as a HACS *Dashboard* custom repository and install **Usage Pie Card**, or copy `usage-pie-card.js` into `/config/www/` and register:
 
 ```yaml
 url: /local/usage-pie-card.js
